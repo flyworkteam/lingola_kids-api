@@ -13,6 +13,7 @@ const languageRoutes = require('./routes/language');
 const lessonRoutes = require('./routes/lesson');
 const progressRoutes = require('./routes/progress');
 const voiceRoutes = require('./routes/voice');
+const webhookRoutes = require('./routes/webhook');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -48,6 +49,8 @@ app.use('/api/languages', languageRoutes);
 app.use('/api/lessons', lessonRoutes);
 app.use('/api/progress', progressRoutes);
 app.use('/api/voices', voiceRoutes);
+app.use('/api/webhooks', webhookRoutes);
+
 
 app.use(notFoundHandler);
 app.use(errorHandler);

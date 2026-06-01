@@ -3,6 +3,19 @@ const { userResponse } = require('./authController');
 
 const allowedAvatars = new Set(['avatar1', 'avatar2', 'avatar3', 'avatar4', 'avatar5', 'avatar6']);
 
+const PREMIUM_WELCOME_DURATION_MS = 2 * 24 * 60 * 60 * 1000;
+
+const calculateWelcomePremiumEndTime = (premiumEndtime) => {
+  const now = new Date();
+  const existingPremiumEndTime = premiumEndtime ? new Date(premiumEndtime) : null;
+
+  if (existingPremiumEndTime && existingPremiumEndTime > now) {
+    return new Date(existingPremiumEndTime.getTime() + PREMIUM_WELCOME_DURATION_MS);
+  }
+
+  return new Date(now.getTime() + PREMIUM_WELCOME_DURATION_MS);
+};
+
 const getWeekActivityAndStreak = async (userId) => {
   const [weekActivityData] = await pool.execute(
     `SELECT DAYOFWEEK(activity_date) AS day_index
@@ -154,6 +167,22 @@ const savePreferences = async (req, res, next) => {
       preferredCategories
     } = req.body;
 
+    const [users] = await connection.execute(
+      'SELECT onboarding_completed, premium_endtime FROM users WHERE id = ? FOR UPDATE',
+      [userId]
+    );
+
+    if (users.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    const userData = users[0];
+    const shouldGrantWelcomePremium = !userData.onboarding_completed;
+    const welcomePremiumEndTime = shouldGrantWelcomePremium
+      ? calculateWelcomePremiumEndTime(userData.premium_endtime)
+      : null;
+
     const updates = [];
     const values = [];
     const fields = {
@@ -170,6 +199,14 @@ const savePreferences = async (req, res, next) => {
         values.push(value);
       }
     }
+
+    if (shouldGrantWelcomePremium) {
+      updates.push('is_premium = ?');
+      values.push(1);
+      updates.push('premium_endtime = ?');
+      values.push(welcomePremiumEndTime);
+    }
+
     values.push(userId);
     await connection.execute(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`, values);
 
@@ -185,7 +222,17 @@ const savePreferences = async (req, res, next) => {
     }
 
     await connection.commit();
-    res.json({ success: true, message: 'Preferences saved successfully' });
+    res.json({
+      success: true,
+      message: shouldGrantWelcomePremium
+        ? 'Preferences saved successfully. 2 days of premium added.'
+        : 'Preferences saved successfully',
+      data: {
+        onboardingCompleted: true,
+        premiumGranted: shouldGrantWelcomePremium,
+        premiumEndTime: welcomePremiumEndTime
+      }
+    });
   } catch (error) {
     await connection.rollback();
     next(error);
