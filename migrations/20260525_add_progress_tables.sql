@@ -1,0 +1,2 @@
+-- Progress tables are created by database.sql. Keep this file for deployment
+-- parity with chatface-backend / lingola_stories_kids-api migration style.
