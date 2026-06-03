@@ -168,7 +168,7 @@ const savePreferences = async (req, res, next) => {
     } = req.body;
 
     const [users] = await connection.execute(
-      'SELECT onboarding_completed, premium_endtime FROM users WHERE id = ? FOR UPDATE',
+      'SELECT onboarding_completed, is_premium, premium_endtime FROM users WHERE id = ? FOR UPDATE',
       [userId]
     );
 
@@ -178,7 +178,10 @@ const savePreferences = async (req, res, next) => {
     }
 
     const userData = users[0];
-    const shouldGrantWelcomePremium = !userData.onboarding_completed;
+    const now = new Date();
+    const currentPremiumEndTime = userData.premium_endtime ? new Date(userData.premium_endtime) : null;
+    const hasActivePremium = !!userData.is_premium && currentPremiumEndTime && currentPremiumEndTime > now;
+    const shouldGrantWelcomePremium = !userData.onboarding_completed && !hasActivePremium;
     const welcomePremiumEndTime = shouldGrantWelcomePremium
       ? calculateWelcomePremiumEndTime(userData.premium_endtime)
       : null;

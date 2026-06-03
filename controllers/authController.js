@@ -7,7 +7,42 @@ const { generateTokenPair, refreshExpiresAt, verifyRefreshToken } = require('../
 const { generateGuestId, generateDeviceId } = require('../utils/generateGuestId');
 const { generateUniqueReferralCode } = require('../utils/generateReferralCode');
 
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+const googleClient = new OAuth2Client();
+const WELCOME_PREMIUM_DURATION_MS = 2 * 24 * 60 * 60 * 1000;
+
+const welcomePremiumEndTime = () => new Date(Date.now() + WELCOME_PREMIUM_DURATION_MS);
+
+const compactUnique = (values) => [
+  ...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))
+];
+
+const googleAudiences = () => compactUnique([
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_IOS_CLIENT_ID,
+  process.env.GOOGLE_ANDROID_CLIENT_ID,
+  process.env.GOOGLE_WEB_CLIENT_ID
+]);
+
+const appleAudiences = () => compactUnique([
+  process.env.APPLE_BUNDLE_ID,
+  process.env.APPLE_SERVICE_ID
+]);
+
+const normalizeDisplayName = (value) => {
+  if (!value) return null;
+  if (typeof value === 'string') return value.trim() || null;
+  if (typeof value === 'object') {
+    const firstName = value.firstName || value.givenName || value.first_name || '';
+    const lastName = value.lastName || value.familyName || value.last_name || '';
+    return `${firstName} ${lastName}`.trim() || null;
+  }
+  return null;
+};
+
+const fallbackSocialEmail = (provider, providerId) => {
+  const safeProviderId = String(providerId || crypto.randomUUID()).replace(/[^a-zA-Z0-9._-]/g, '');
+  return `${provider}_${safeProviderId}@lingolakids.local`;
+};
 
 const userResponse = (user) => ({
   id: user.id,
@@ -22,6 +57,8 @@ const userResponse = (user) => ({
   is_guest: !!user.is_guest,
   isPremium: !!user.is_premium,
   is_premium: !!user.is_premium,
+  premiumEndTime: user.premium_endtime,
+  premium_endtime: user.premium_endtime,
   onboardingCompleted: !!user.onboarding_completed,
   onboarding_completed: !!user.onboarding_completed,
   preferredLanguage: user.preferred_language || 'en',
@@ -127,9 +164,10 @@ const createGuestUser = async (req, res, next) => {
 
     const [result] = await connection.execute(
       `INSERT INTO users (
-         email, full_name, auth_provider, provider_id, is_guest, guest_device_id, invitation_code, avatar_key
-       ) VALUES (?, ?, 'guest', ?, 1, ?, ?, 'avatar1')`,
-      [email, 'Guest', guestId, deviceId, invitationCode]
+         email, full_name, auth_provider, provider_id, is_guest, guest_device_id,
+         invitation_code, avatar_key, is_premium, premium_endtime
+       ) VALUES (?, ?, 'guest', ?, 1, ?, ?, 'avatar1', 1, ?)`,
+      [email, 'Guest', guestId, deviceId, invitationCode, welcomePremiumEndTime()]
     );
 
     const [users] = await connection.execute('SELECT * FROM users WHERE id = ?', [result.insertId]);
@@ -159,9 +197,16 @@ const verifyGoogleToken = async (idToken) => {
     };
   }
 
+  const audiences = googleAudiences();
+  if (audiences.length === 0) {
+    const error = new Error('Google client ID is not configured');
+    error.statusCode = 500;
+    throw error;
+  }
+
   const ticket = await googleClient.verifyIdToken({
     idToken,
-    audience: process.env.GOOGLE_CLIENT_ID
+    audience: audiences
   });
   const payload = ticket.getPayload();
   return {
@@ -181,6 +226,13 @@ const verifyAppleToken = async (identityToken) => {
     };
   }
 
+  const audiences = appleAudiences();
+  if (audiences.length === 0) {
+    const error = new Error('Apple client ID is not configured');
+    error.statusCode = 500;
+    throw error;
+  }
+
   const keysResponse = await axios.get('https://appleid.apple.com/auth/keys');
   const jwk = keysResponse.data.keys.find((key) => key.kid === decoded.header?.kid);
   if (!jwk) {
@@ -195,7 +247,7 @@ const verifyAppleToken = async (identityToken) => {
   });
   const payload = jwt.verify(identityToken, publicKey, {
     algorithms: ['RS256'],
-    audience: process.env.APPLE_BUNDLE_ID
+    audience: audiences
   });
   return {
     providerId: payload.sub,
@@ -210,8 +262,10 @@ const socialSignIn = async ({ req, res, next, provider, identity }) => {
 
     const guestUser = await getBearerUser(req);
     const providerId = identity.providerId;
-    const email = identity.email;
-    const fullName = identity.fullName || req.body.user?.name || req.body.user?.fullName || null;
+    const email = identity.email || fallbackSocialEmail(provider, providerId);
+    const fullName = normalizeDisplayName(
+      identity.fullName || req.body.user?.name || req.body.user?.fullName
+    );
 
     const [existing] = await connection.execute(
       'SELECT * FROM users WHERE auth_provider = ? AND provider_id = ? AND deleted_at IS NULL LIMIT 1',
@@ -242,9 +296,10 @@ const socialSignIn = async ({ req, res, next, provider, identity }) => {
       const invitationCode = await generateUniqueReferralCode(connection);
       const [result] = await connection.execute(
         `INSERT INTO users (
-          email, full_name, auth_provider, provider_id, is_guest, invitation_code, avatar_key, last_login_at
-        ) VALUES (?, ?, ?, ?, 0, ?, 'avatar1', NOW())`,
-        [email, fullName, provider, providerId, invitationCode]
+          email, full_name, auth_provider, provider_id, is_guest, invitation_code,
+          avatar_key, is_premium, premium_endtime, last_login_at
+        ) VALUES (?, ?, ?, ?, 0, ?, 'avatar1', 1, ?, NOW())`,
+        [email, fullName, provider, providerId, invitationCode, welcomePremiumEndTime()]
       );
       const [rows] = await connection.execute('SELECT * FROM users WHERE id = ?', [result.insertId]);
       user = rows[0];
@@ -280,7 +335,7 @@ const googleSignIn = async (req, res, next) => {
 const appleSignIn = async (req, res, next) => {
   try {
     const identity = await verifyAppleToken(req.body.identityToken);
-    identity.fullName = req.body.user?.fullName || req.body.user?.name || null;
+    identity.fullName = normalizeDisplayName(req.body.user?.fullName || req.body.user?.name);
     return socialSignIn({ req, res, next, provider: 'apple', identity });
   } catch (error) {
     next(error);
