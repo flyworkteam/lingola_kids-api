@@ -14,6 +14,7 @@ const lessonRoutes = require('./routes/lesson');
 const progressRoutes = require('./routes/progress');
 const voiceRoutes = require('./routes/voice');
 const webhookRoutes = require('./routes/webhook');
+const panelRoutes = require('./routes/panelRoutes');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -50,6 +51,7 @@ app.use('/api/lessons', lessonRoutes);
 app.use('/api/progress', progressRoutes);
 app.use('/api/voices', voiceRoutes);
 app.use('/api/webhooks', webhookRoutes);
+app.use('/panel/v1', panelRoutes);
 
 
 app.use(notFoundHandler);
