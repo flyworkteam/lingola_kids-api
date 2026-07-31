@@ -8,6 +8,7 @@ const { generateGuestId, generateDeviceId } = require('../utils/generateGuestId'
 const { generateUniqueReferralCode } = require('../utils/generateReferralCode');
 
 const googleClient = new OAuth2Client();
+/** Welcome / free trial length — exactly 2 days (48 hours). */
 const WELCOME_PREMIUM_DURATION_MS = 2 * 24 * 60 * 60 * 1000;
 
 const welcomePremiumEndTime = () => new Date(Date.now() + WELCOME_PREMIUM_DURATION_MS);
@@ -44,30 +45,51 @@ const fallbackSocialEmail = (provider, providerId) => {
   return `${provider}_${safeProviderId}@lingolakids.local`;
 };
 
-const userResponse = (user) => ({
-  id: user.id,
-  email: user.email,
-  fullName: user.full_name,
-  full_name: user.full_name,
-  avatarKey: user.avatar_key || 'avatar1',
-  avatar_key: user.avatar_key || 'avatar1',
-  authProvider: user.auth_provider,
-  auth_provider: user.auth_provider,
-  isGuest: !!user.is_guest,
-  is_guest: !!user.is_guest,
-  isPremium: !!user.is_premium,
-  is_premium: !!user.is_premium,
-  premiumEndTime: user.premium_endtime,
-  premium_endtime: user.premium_endtime,
-  onboardingCompleted: !!user.onboarding_completed,
-  onboarding_completed: !!user.onboarding_completed,
-  preferredLanguage: user.preferred_language || 'en',
-  preferred_language: user.preferred_language || 'en',
-  invitationCode: user.invitation_code,
-  invitation_code: user.invitation_code,
-  createdAt: user.created_at,
-  created_at: user.created_at
-});
+const isPremiumStillActive = (user) => {
+  if (!user?.is_premium) return false;
+  if (!user.premium_endtime) return true;
+  return new Date(user.premium_endtime).getTime() > Date.now();
+};
+
+/** Welcome trial is not revoked by RevenueCat — clear the flag when end time passes. */
+const expirePremiumIfNeeded = async (executor, user) => {
+  if (!user?.is_premium || !user.premium_endtime) return user;
+  if (new Date(user.premium_endtime).getTime() > Date.now()) return user;
+
+  await executor.execute(
+    'UPDATE users SET is_premium = 0 WHERE id = ? AND is_premium = 1',
+    [user.id]
+  );
+  return { ...user, is_premium: 0 };
+};
+
+const userResponse = (user) => {
+  const activePremium = isPremiumStillActive(user);
+  return {
+    id: user.id,
+    email: user.email,
+    fullName: user.full_name,
+    full_name: user.full_name,
+    avatarKey: user.avatar_key || 'avatar1',
+    avatar_key: user.avatar_key || 'avatar1',
+    authProvider: user.auth_provider,
+    auth_provider: user.auth_provider,
+    isGuest: !!user.is_guest,
+    is_guest: !!user.is_guest,
+    isPremium: activePremium,
+    is_premium: activePremium,
+    premiumEndTime: user.premium_endtime,
+    premium_endtime: user.premium_endtime,
+    onboardingCompleted: !!user.onboarding_completed,
+    onboarding_completed: !!user.onboarding_completed,
+    preferredLanguage: user.preferred_language || 'en',
+    preferred_language: user.preferred_language || 'en',
+    invitationCode: user.invitation_code,
+    invitation_code: user.invitation_code,
+    createdAt: user.created_at,
+    created_at: user.created_at
+  };
+};
 
 const saveRefreshToken = async (connection, userId, refreshToken, deviceInfo = null) => {
   await connection.execute(
@@ -77,10 +99,11 @@ const saveRefreshToken = async (connection, userId, refreshToken, deviceInfo = n
 };
 
 const authPayload = async (connection, user, deviceInfo = null) => {
-  const tokens = generateTokenPair(user);
-  await saveRefreshToken(connection, user.id, tokens.refreshToken, deviceInfo);
+  const freshUser = await expirePremiumIfNeeded(connection, user);
+  const tokens = generateTokenPair(freshUser);
+  await saveRefreshToken(connection, freshUser.id, tokens.refreshToken, deviceInfo);
   return {
-    user: userResponse(user),
+    user: userResponse(freshUser),
     tokens: {
       accessToken: tokens.accessToken,
       refreshToken: tokens.refreshToken,
@@ -157,8 +180,78 @@ const createGuestUser = async (req, res, next) => {
     const { device_info } = req.body;
     const userAgent = req.get('user-agent') || '';
     const platform = device_info?.platform || '';
+    const clientDeviceId =
+      typeof device_info?.device_id === 'string' ? device_info.device_id.trim() : '';
+    const deviceId =
+      clientDeviceId || generateDeviceId(userAgent, platform);
+    const requestedGuestUserId = Number.parseInt(
+      String(device_info?.guest_user_id ?? ''),
+      10
+    );
+
+    const resumeGuest = async (row) => {
+      let user = await expirePremiumIfNeeded(connection, row);
+      // Keep device mapping in sync so later logins can resume by device_id too.
+      if (clientDeviceId && user.guest_device_id !== clientDeviceId) {
+        await connection.execute(
+          'UPDATE users SET guest_device_id = ?, last_login_at = NOW() WHERE id = ?',
+          [clientDeviceId, user.id]
+        );
+      } else {
+        await connection.execute(
+          'UPDATE users SET last_login_at = NOW() WHERE id = ?',
+          [user.id]
+        );
+      }
+      const [refreshed] = await connection.execute(
+        'SELECT * FROM users WHERE id = ? LIMIT 1',
+        [user.id]
+      );
+      user = refreshed[0] || user;
+      const payload = await authPayload(connection, user, device_info);
+      await connection.commit();
+      return res.status(200).json({
+        success: true,
+        message: 'Guest user resumed successfully',
+        data: payload
+      });
+    };
+
+    // 1) Prefer the last guest account used on this device (survives logout).
+    if (Number.isInteger(requestedGuestUserId) && requestedGuestUserId > 0) {
+      const [byId] = await connection.execute(
+        `SELECT * FROM users
+         WHERE id = ?
+           AND is_guest = 1
+           AND is_active = 1
+           AND deleted_at IS NULL
+         LIMIT 1`,
+        [requestedGuestUserId]
+      );
+      if (byId.length > 0) {
+        return resumeGuest(byId[0]);
+      }
+    }
+
+    // 2) Fallback: resume by stable device id.
+    if (clientDeviceId) {
+      const [existingGuests] = await connection.execute(
+        `SELECT * FROM users
+         WHERE guest_device_id = ?
+           AND is_guest = 1
+           AND is_active = 1
+           AND deleted_at IS NULL
+         ORDER BY id DESC
+         LIMIT 1`,
+        [clientDeviceId]
+      );
+
+      if (existingGuests.length > 0) {
+        return resumeGuest(existingGuests[0]);
+      }
+    }
+
     const guestId = generateGuestId();
-    const deviceId = generateDeviceId(userAgent, platform);
     const invitationCode = await generateUniqueReferralCode(connection);
     const email = `guest_${Date.now()}_${Math.floor(Math.random() * 10000)}@lingolakids.local`;
 
@@ -412,10 +505,11 @@ const getCurrentUser = async (req, res, next) => {
     if (users.length === 0) {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
+    const user = await expirePremiumIfNeeded(pool, users[0]);
     res.json({
       success: true,
       message: 'Current user retrieved',
-      data: { user: userResponse(users[0]) }
+      data: { user: userResponse(user) }
     });
   } catch (error) {
     next(error);
@@ -429,5 +523,7 @@ module.exports = {
   refreshAccessToken,
   logout,
   getCurrentUser,
-  userResponse
+  userResponse,
+  expirePremiumIfNeeded,
+  WELCOME_PREMIUM_DURATION_MS
 };

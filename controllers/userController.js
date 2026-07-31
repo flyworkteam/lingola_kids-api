@@ -1,8 +1,9 @@
 const { pool } = require('../config/database');
-const { userResponse } = require('./authController');
+const { userResponse, expirePremiumIfNeeded } = require('./authController');
 
 const allowedAvatars = new Set(['avatar1', 'avatar2', 'avatar3', 'avatar4', 'avatar5', 'avatar6']);
 
+/** Welcome / free trial length — exactly 2 days (48 hours). Must match authController. */
 const PREMIUM_WELCOME_DURATION_MS = 2 * 24 * 60 * 60 * 1000;
 
 const calculateWelcomePremiumEndTime = (premiumEndtime) => {
@@ -66,6 +67,8 @@ const getUserProfile = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
 
+    const user = await expirePremiumIfNeeded(pool, users[0]);
+
     const [categories] = await pool.execute(
       'SELECT category_name FROM user_preferred_categories WHERE user_id = ?',
       [userId]
@@ -76,14 +79,14 @@ const getUserProfile = async (req, res, next) => {
       success: true,
       data: {
         user: {
-          ...userResponse(users[0]),
-          age: users[0].age,
-          gender: users[0].gender,
-          country: users[0].country,
-          lastLoginAt: users[0].last_login_at,
-          last_login_at: users[0].last_login_at,
-          updatedAt: users[0].updated_at,
-          updated_at: users[0].updated_at
+          ...userResponse(user),
+          age: user.age,
+          gender: user.gender,
+          country: user.country,
+          lastLoginAt: user.last_login_at,
+          last_login_at: user.last_login_at,
+          updatedAt: user.updated_at,
+          updated_at: user.updated_at
         },
         profile: {
           preferredCategories: categories.map((category) => category.category_name),
@@ -274,7 +277,8 @@ const deleteAccount = async (req, res, next) => {
            deleted_at = NOW(),
            email = CONCAT('deleted_', id, '@lingolakids.local'),
            full_name = NULL,
-           provider_id = NULL
+           provider_id = NULL,
+           guest_device_id = NULL
        WHERE id = ?`,
       [userId]
     );

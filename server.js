@@ -65,7 +65,7 @@ const startServer = async () => {
       process.exit(1);
     }
 
-    app.listen(PORT, () => {
+    app.listen(PORT, '0.0.0.0', () => {
       console.log('');
       console.log('========================================');
       console.log('  Lingola Kids Backend Server');
@@ -73,6 +73,7 @@ const startServer = async () => {
       console.log(`  Environment: ${process.env.NODE_ENV || 'development'}`);
       console.log(`  Port: ${PORT}`);
       console.log(`  URL: http://localhost:${PORT}`);
+      console.log(`  LAN: http://0.0.0.0:${PORT}`);
       console.log('========================================');
       console.log('  GET  /api/lessons');
       console.log('  GET  /api/progress/current');
